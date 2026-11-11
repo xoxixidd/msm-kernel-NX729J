@@ -102,7 +102,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
       actions: write
@@ -384,14 +384,83 @@ jobs:
           echo "KSUTAG=$TAG" >> "$GITHUB_OUTPUT"
           echo "KSUSRC=$SRC" >> "$GITHUB_OUTPUT"
 
+      - name: 配置 apt（抗 DNS 失败）
+        run: |
+          set -e
+          # ── 为什么要有这步 ────────────────────────────────────────────────
+          # GitHub runner 的 apt 源指向 azure.archive.ubuntu.com，该域名会整个
+          # job 期间解析失败（Temporary failure resolving）。apt 默认对同一个
+          # mirror 重试 3 次、每次等 120 秒超时，一条目就要 4 分钟，装十几个包
+          # 直接撞掉 20 分钟还不报错。
+          #
+          # 对策（均有社区实证）：
+          #   ① 超时压到 20 秒     THRIFT-6234
+          #   ② Retries 设 0       apt 快速跳到下一个 mirror（源列表本身有 3 个）
+          #   ③ ForceIPv4          spiceai #10349，绕开 IPv6 解析异常
+          #   ④ 源换 IP 直连        AutoBot #21330，DNS 挂了也能用
+          # ──────────────────────────────────────────────────────────────────
+          sudo tee /etc/apt/apt.conf.d/99-ci-tune >/dev/null <<'EOF'
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          Acquire::ftp::Timeout "20";
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "0";
+          DPkg::Lock::Timeout "120";
+          EOF
+
+          UBUNTU_MAIN=91.189.91.81
+          UBUNTU_SEC=91.189.91.82
+          for f in /etc/apt/sources.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i \
+              -e "s|http://azure\\.archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|http://archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|https://archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|http://security\\.ubuntu\\.com|http://$UBUNTU_SEC|g" \
+              -e "s|https://security\\.ubuntu\\.com|http://$UBUNTU_SEC|g" \
+              "$f" || true
+          done
+          for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i \
+              -e "s|http://azure\\.archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|http://archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|https://archive\\.ubuntu\\.com|http://$UBUNTU_MAIN|g" \
+              -e "s|http://security\\.ubuntu\\.com|http://$UBUNTU_SEC|g" \
+              -e "s|https://security\\.ubuntu\\.com|http://$UBUNTU_SEC|g" \
+              "$f" || true
+          done
+          echo "=== 改后源 ==="
+          grep -rhoE 'https?://[0-9.a-z-]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sort -u || true
+
       - name: 安装依赖 + 下载 AOSP clang
         run: |
-          # runner 镜像自带的 apt 索引可能比镜像源旧：索引里的版本号已被下架时会直接 404
-          # （2026-10-25 就是这样栽在 liblzma-dev_5.6.1+really5.4.5-1ubuntu0.3 上，
-          #   构建连第一步都没过去）。先 update 刷新索引，再装。
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils python-is-python3 libssl-dev libelf-dev libdw-dev bc dwarves ccache zip unzip
+          set -e
+          # 先查有没有，缺的才装（runner 镜像自带大部分，减少下载量）
+          NEED=""
+          for pkg in binutils python3 libssl-dev libelf-dev bc zip unzip; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || NEED="$NEED $pkg"
+          done
+          command -v ccache >/dev/null 2>&1 || NEED="$NEED ccache"
+          command -v pahole >/dev/null 2>&1 || NEED="$NEED dwarves"
+          dpkg -s libdw-dev >/dev/null 2>&1 || NEED="$NEED libdw-dev"
+          if [ -n "$NEED" ]; then
+            echo "需要安装:$NEED"
+            # Retries=0 + 20s 超时下，apt 会在 40 秒内换到下一个源；
+            # 这里最多试 2 轮，整体不会超过几分钟
+            for i in 1 2; do
+              echo "--- apt 第 $i 轮 ---"
+              if sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=20 \
+                 && sudo apt-get install -y --no-install-recommends $NEED; then
+                echo "依赖安装成功"; break
+              fi
+              [ "$i" = "2" ] && { echo "::error::依赖安装失败（apt DNS 或网络问题）"; exit 1; }
+              echo "重试中..."; sleep 5
+            done
+          else
+            echo "依赖已齐，跳过 apt install"
+            sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=20 || echo "::warning::apt update 失败但不影响（依赖已齐）"
+          fi
           # clang-r450784d = android13-5.15 时代 clang-14（与 build.config.constants 里 pin 的 r450784e 同族，
           # googlesource 上 r450784e 无 tag 可下，r450784d 确认可从 android-platform-13.0.0_r28 tag 下载）
           echo "正在下载 clang-${{ env.CLANG_VER }} ..."
