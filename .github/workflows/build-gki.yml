@@ -338,9 +338,11 @@ jobs:
           #   依据：defpackage/ek3.java 的 11 个 context 清单不含 su / su_file
           #   SukiSU builtin 的 selinux.h 路径与 BakaSU 相同（kernel/selinux/selinux.h），宏名也相同
           #
-          #   位置很关键：必须在 case/esac 之后 —— 因为 REF=latest 会 git checkout main，
+          #   位置很关键：必须在 case/esac 之后 —— 因为 REF=latest 会 git checkout，
           #   若先 sed 再 checkout，git 会因「本地有未提交改动」拒绝切换而失败。
-          cd KernelSU
+          #
+          #   ★ 这里不要再 cd KernelSU —— 外层在 clone 之后已经 cd 进去了，
+          #     执行到这一步时工作目录就是 KernelSU/。多 cd 一次会 No such file or directory。
           sed -i 's/#define KERNEL_SU_DOMAIN "ksu"/#define KERNEL_SU_DOMAIN "su"/' kernel/selinux/selinux.h
           sed -i 's/#define KERNEL_SU_FILE "ksu_file"/#define KERNEL_SU_FILE "su_file"/' kernel/selinux/selinux.h
           # 必须真的改到，否则等于没改（防上游改了宏的写法）
@@ -349,8 +351,9 @@ jobs:
           grep -q '#define KERNEL_SU_FILE "su_file"' kernel/selinux/selinux.h \
             || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_FILE \"ksu_file\""; exit 1; }
           grep -n 'KERNEL_SU_DOMAIN\|KERNEL_SU_FILE' kernel/selinux/selinux.h
-          cd ..
           # （checkout 在 case 块里做，这里已在目标提交上，改完不会被覆盖）
+          # 注意：保持在工作目录 KernelSU/ 内，后面 V=$(git rev-list --count HEAD)
+          #       要在 KSU 仓库里数提交，不能提前 cd ..
 
           V=$(git rev-list --count HEAD)
           TAG=$(git describe --abbrev=0 --tags 2>/dev/null || echo unknown)
