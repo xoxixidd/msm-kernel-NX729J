@@ -262,7 +262,7 @@ jobs:
           echo "=== swap 就绪 ==="
           free -h || true
 
-      - name: 编译内核+模块（生成 Module.symvers）
+      - name: 编译 vmlinux（生成 Module.symvers）
         working-directory: kernel-tree
         run: |
           export PATH="$CLANG_DIR:$PATH"
@@ -270,19 +270,35 @@ jobs:
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
           # ★ 不再用 modules_prepare —— 它不生成 Module.symvers。
           #   本机 CONFIG_MODVERSIONS=y，模块必须带正确的符号 CRC 才能加载，
-          #   而 Module.symvers 只有完整编过内核（链接出 vmlinux）才生成。
-          #   所以这里直接编 modules，kbuild 会自动先建 vmlinux 再编模块。
-          echo "=== 编译内核 + 模块（会先链接 vmlinux 生成 Module.symvers）==="
-          if make O=out ARCH=arm64 LLVM=1 -j$(nproc) > /tmp/mp.log 2>&1; then
-            echo "内核+模块编译成功"
-          else
-            RC=$?
+          #   而 Module.symvers 只有链接出 vmlinux 才生成。
+          #   所以这里编 vmlinux（比全量 make 少编 modules/dtbs）。
+          #
+          # ★ 输出必须实时可见：上一轮把 make 全重定向到 /tmp/mp.log，
+          #   25 分钟零输出，被外部 SIGTERM 杀（exit 143）。
+          #   现在用 tee 同时进日志和 stdout，并每 30 秒打一次心跳。
+          echo "=== 编译 vmlinux（生成 Module.symvers）==="
+          make O=out ARCH=arm64 LLVM=1 -j$(nproc) vmlinux 2>&1 | tee /tmp/mp.log &
+          MK_PID=$!
+
+          HB=0
+          while kill -0 $MK_PID 2>/dev/null; do
+            sleep 30
+            HB=$((HB+1))
+            if kill -0 $MK_PID 2>/dev/null; then
+              echo "[心跳 $HB] 编译进行中，$(date -u +%H:%M:%S)  log 行数=$(wc -l < /tmp/mp.log 2>/dev/null || echo 0)  可用内存=$(free -m | awk '/^Mem:/{print $7}')M"
+            fi
+          done
+
+          wait $MK_PID
+          RC=$?
+          if [ $RC -ne 0 ]; then
             echo "::error::编译失败（rc=$RC）"
-            grep -iE "error:|错误|No such file|command not found|fatal" /tmp/mp.log | tail -40 || true
+            grep -iE "error:|错误|No such file|command not found|fatal|Killed" /tmp/mp.log | tail -40 || true
             echo "──── 完整尾部 60 行 ────"
             tail -60 /tmp/mp.log
             exit 1
           fi
+          echo "vmlinux 编译成功"
           echo "=== 检查 Module.symvers ==="
           if [ -s out/Module.symvers ]; then
             echo "  Module.symvers 存在，$(wc -l < out/Module.symvers) 条符号"
