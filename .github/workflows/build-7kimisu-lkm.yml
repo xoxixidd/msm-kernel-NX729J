@@ -75,9 +75,23 @@ jobs:
           # runner 的 DNS 挂掉时 apt 必然失败，直接跳过。
           # 缺什么在下面编译步骤会明确报出来。
           echo "=== 现有工具 ==="
-          for t in make gcc clang python3 git tar curl; do
+          MISSING=""
+          for t in make gcc clang python3 git tar curl flex bison bc bzip2 lz4 zstd cpio; do
             printf '  %-10s ' "$t"
-            command -v "$t" >/dev/null 2>&1 && echo "OK ($(command -v $t))" || echo "缺失"
+            if command -v "$t" >/dev/null 2>&1; then
+              echo "OK"
+            else
+              echo "缺失"
+              MISSING="$MISSING $t"
+            fi
+          done
+          echo "=== 缺失清单:$MISSING ==="
+          # flex / bison / bc 是编内核 scripts/dtc 和 Kconfig 的硬依赖
+          for hard in flex bison bc; do
+            echo "$MISSING" | grep -qw "$hard" && {
+              echo "::error::缺少硬依赖 $hard —— 内核编译脚本需要它，且 runner 的 apt DNS 挂着装不上"
+              exit 1
+            }
           done
           echo "=== OPTIONAL（本流程不需要）==="
           command -v ccache >/dev/null 2>&1 && echo "  ccache   有（会加速）" || echo "  ccache   无（不影响）"
@@ -185,15 +199,27 @@ jobs:
       - name: 编译内核（modules_prepare）
         working-directory: kernel-tree
         run: |
-          set -e
           export PATH="$CLANG_DIR:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
           echo "=== modules_prepare ==="
-          make O=out ARCH=arm64 LLVM=1 modules_prepare -j$(nproc) 2>&1 | tail -30
-          echo "=== 记录本机 vermagic 期望值 ==="
-          make O=out ARCH=arm64 LLVM=1 kernelrelease 2>/dev/null || \
-            cat out/include/config/kernel.release 2>/dev/null || echo "(取不到)"
+          # 不用管道，直接落日志：管道会吃掉 make 的退出码，tail 还会截掉真错误
+          if make O=out ARCH=arm64 LLVM=1 modules_prepare -j$(nproc) > /tmp/mp.log 2>&1; then
+            echo "modules_prepare 成功"
+          else
+            RC=$?
+            echo "::error::modules_prepare 失败（rc=$RC），错误尾部如下"
+            grep -iE "error|错误|No such file|command not found|not found" /tmp/mp.log | tail -40 || true
+            echo "──── 完整尾部 60 行 ────"
+            tail -60 /tmp/mp.log
+            exit 1
+          fi
+          echo "=== 本机 vermagic 期望值 ==="
+          make O=out ARCH=arm64 LLVM=1 kernelrelease 2>/dev/null     || \
+          cat out/include/config/kernel.release 2>/dev/null         || \
+          echo "::error::取不到 kernelrelease"
+          # modules_prepare 不会生成 Module.symvers，需要注意
+          ls -l out/Module.symvers 2>/dev/null || echo "(没有 Module.symvers，外部模块可能报 undefined symbol)"
 
       - name: 编译 7kimisu 模块
         working-directory: KernelSU/kernel
@@ -203,14 +229,29 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
           KTREE="$GITHUB_WORKSPACE/kernel-tree"
-          echo "=== 用 7kimisu 自己的 Makefile，KDIR 指向本机内核树 ==="
-          make KDIR="$KTREE" CONFIG_KSU=m CC="clang" -j$(nproc) 2>&1 | tail -60 || {
-            echo "::error::模块编译失败，尝试直接 kbuild"
-            make -C "$KTREE" M="$PWD" src="$PWD" O="$KTREE/out" \
-                 ARCH=arm64 LLVM=1 CONFIG_KSU=m modules -j$(nproc) 2>&1 | tail -60
-          }
+          echo "=== 方案 A：7kimisu 自己的 Makefile（KDIR 指向内核树）==="
+          if make KDIR="$KTREE" CONFIG_KSU=m CC="clang" -j$(nproc) > /tmp/mk.log 2>&1; then
+            echo "方案 A 成功"
+          else
+            echo "方案 A 失败，尾部 40 行："
+            tail -40 /tmp/mk.log || true
+            echo ""
+            echo "=== 方案 B：直接 kbuild（M= + O=）==="
+            if make -C "$KTREE" M="$PWD" src="$PWD" O="$KTREE/out" \
+                 ARCH=arm64 LLVM=1 CONFIG_KSU=m modules -j$(nproc) > /tmp/kb.log 2>&1; then
+              echo "方案 B 成功"
+            else
+              echo "方案 B 也失败，尾部 40 行："
+              tail -40 /tmp/kb.log || true
+              echo "──── 方案A 的完整错误 ────"
+              grep -iE "error|Error|No such|not found|undefined" /tmp/mk.log | tail -30 || true
+              exit 1
+            fi
+          fi
           echo "=== 找产物 ==="
-          find . -name "kernelsu.ko" -o -name "*.ko" | head -20
+          find . -name "*.ko" 2>/dev/null | head -20
+          echo "=== 内核树里的产物 ==="
+          find "$KTREE/out" -name "kernelsu*" 2>/dev/null | head -10 || true
 
       - name: 校验 vermagic
         run: |
