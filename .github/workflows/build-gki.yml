@@ -392,7 +392,7 @@ jobs:
           #   192|  db = &pol->policydb;
           #   193|
           #   194|  policydb->latest_granting = old_pol->latest_granting + 1;
-          #         ^^^^^^^^ 这个变量不存在，上一行定义的是 db
+          #         ^^^^^^^^ 应为 pol->  （5.15 的 latest_granting 在 selinux_policy 上）
           #
           # 5.15 上 clang 报：
           #   error: must use 'struct' tag to refer to type 'policydb'
@@ -406,12 +406,15 @@ jobs:
           echo "=== 改前 ==="
           grep -n 'latest_granting = old_pol->latest_granting' "$F" || true
 
-          sed -i 's/policydb->latest_granting = old_pol->latest_granting + 1;/db->latest_granting = old_pol->latest_granting + 1;/' "$F"
+          # ★ 正确写法是 pol->，不是 policydb-> 也不是 db->
+          #   5.15 的 latest_granting 在 struct selinux_policy（services.h:29），
+          #   不在 struct policydb 里；第 195 行本身就用了 pol->latest_granting。
+          sed -i 's/policydb->latest_granting = old_pol->latest_granting + 1;/pol->latest_granting = old_pol->latest_granting + 1;/' "$F"
 
           echo "=== 改后 ==="
           grep -n 'latest_granting = old_pol->latest_granting' "$F" || true
           # 硬校验：必须已经变成 db->
-          grep -q 'db->latest_granting = old_pol->latest_granting + 1;' "$F" \
+          grep -q 'pol->latest_granting = old_pol->latest_granting + 1;' "$F" \
             || { echo "::error::补丁没打上（上游可能已修，或写法变了）"; grep -n 'latest_granting' "$F" | head; exit 1; }
           echo "补丁生效"
 
