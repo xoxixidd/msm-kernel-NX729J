@@ -384,27 +384,56 @@ jobs:
           echo "KSUTAG=$TAG" >> "$GITHUB_OUTPUT"
           echo "KSUSRC=$SRC" >> "$GITHUB_OUTPUT"
 
-      - name: 安装依赖（最小化，先查后装）
+      - name: 装 libelf-dev（绕过 apt，IP 直连 .deb）
         run: |
           set -e
-          # ubuntu-latest 镜像自带 build-essential / bc / bison / flex /
-          # libssl-dev / libelf-dev / zip / curl，不用重装。
-          # 真正可能缺的只有这三个：pahole(dwarves) / ccache / libdw-dev
-          NEED=""
-          command -v pahole >/dev/null 2>&1        || NEED="$NEED dwarves"
-          command -v ccache >/dev/null 2>&1        || NEED="$NEED ccache"
-          dpkg -s libdw-dev >/dev/null 2>&1        || NEED="$NEED libdw-dev"
-          if [ -z "$NEED" ]; then
-            echo "依赖已齐，跳过 apt（ubuntu-latest 镜像自带）"
-          else
-            echo "需要安装:$NEED"
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends $NEED
+          # ── 为什么不用 apt ────────────────────────────────────────────────
+          # runner 的 apt 源 azure.archive.ubuntu.com 整个 job 期间解析失败，
+          # 连 archive.ubuntu.com / security.ubuntu.com 也一起失败（见历次日志）。
+          # 但 Ubuntu 官方 archive 的 IP 是通的，直接 curl .deb 绕过 mirror 逻辑。
+          # ──────────────────────────────────────────────────────────────────
+          if [ -f /usr/include/libelf.h ] && [ -f /usr/include/elfutils/libdw.h ]; then
+            echo "libelf-dev / libdw-dev 已存在，跳过"
+            dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version)' || true
+            exit 0
           fi
-          echo "=== 版本确认 ==="
-          gcc --version | head -n1 || true
-          pahole --version 2>/dev/null || echo "pahole 未装（不需要 BTF 时可忽略）"
-          ccache --version 2>/dev/null | head -n1 || true
+
+          MIRROR="http://91.189.91.81/ubuntu"
+          TMP=$(mktemp -d)
+          cd "$TMP"
+
+          fetch() {
+            echo "下载 $1"
+            curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -O "$MIRROR/$1" \
+              || { echo "::error::下载失败 $MIRROR/$1"; exit 1; }
+          }
+
+          fetch "pool/main/e/elfutils/libelf-dev_0.190-1.1ubuntu0.1_amd64.deb"
+          fetch "pool/main/e/elfutils/libdw-dev_0.190-1.1ubuntu0.1_amd64.deb"
+
+          echo "=== dpkg -i ==="
+          sudo dpkg -i ./*.deb || {
+            echo "::warning::dpkg 报依赖问题，尝试补齐（apt 可能失败，但不影响已解包的头文件）"
+            sudo apt-get install -f -y || true
+          }
+
+          echo "=== 校验 ==="
+          ls -l /usr/include/libelf.h /usr/include/elfutils/libdw.h 2>/dev/null || {
+            echo "::error::libelf.h / libdw.h 仍未就位"
+            exit 1
+          }
+          dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version|Status)' || true
+
+      - name: 工具检查（不装包）
+        run: |
+          echo "=== 必需工具 ==="
+          for t in make gcc clang python3 git tar curl flex bison bc bzip2; do
+            printf '  %-10s ' "$t"
+            command -v "$t" >/dev/null 2>&1 && echo OK || echo "缺失"
+          done
+          echo "=== 可选 ==="
+          command -v ccache >/dev/null 2>&1 && echo "  ccache  有" || echo "  ccache  无（只是慢）"
+          command -v pahole >/dev/null 2>&1 && echo "  pahole  有" || echo "  pahole  无（本版关了 eBPF/BTF，不需要）"
       - name: 下载 AOSP clang
         run: |
           set -e
@@ -428,9 +457,13 @@ jobs:
           echo "CCACHE_COMPILERCHECK=none" >> $GITHUB_ENV
           echo "CCACHE_NOHASHDIR=true" >> $GITHUB_ENV
           mkdir -p "$HOME/.ccache"
-          ccache -M 3G
-          ccache -o compression=true
-          echo "ccache 初始状态:"; ccache -s
+          if command -v ccache >/dev/null 2>&1; then
+            ccache -M 3G
+            ccache -o compression=true
+            ccache -s
+          else
+            echo "::warning::ccache 未安装，跳过（不影响编译，只是慢）"
+          fi
 
       - name: 载入 ccache 缓存
         uses: actions/cache@v4
