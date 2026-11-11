@@ -1,0 +1,100 @@
+name: Build NX729J Kernel (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch:
+        description: 'SukiSU branch (builtin = has SUSFS options)'
+        required: false
+        default: 'builtin'
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: false
+        default: 'gki-android13-5.15'
+      make_defconfig:
+        description: 'defconfig to use'
+        required: false
+        default: 'gki_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Clean workspace
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: nx729j-5.15.167
+          fetch-depth: 1
+
+      - name: Verify version
+        run: |
+          echo "=== Makefile version ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) ' Makefile
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
+            libelf-dev zip unzip cpio rsync python3 python3-pip git curl xz-utils \
+            device-tree-compiler zstd lz4
+
+      - name: Download AOSP clang r450784e
+        run: |
+          set -e
+          CLANG_DIR="${{ github.workspace }}/../clang"
+          mkdir -p "$CLANG_DIR"
+          cd "$CLANG_DIR"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r450784e.tar.gz"
+          echo "Downloading $URL"
+          curl -LSs "$URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          ./bin/clang --version || true
+
+      - name: Integrate SukiSU-Ultra
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" -o /tmp/setup.sh
+          bash /tmp/setup.sh ${{ github.event.inputs.ksu_branch }}
+          echo "=== drivers/kernelsu ==="
+          ls -la drivers/kernelsu | head -20
+          echo "=== drivers/Kconfig tail ==="
+          tail -5 drivers/Kconfig
+          echo "=== drivers/Makefile tail ==="
+          tail -5 drivers/Makefile
+
+      - name: Apply SUSFS patch
+        run: |
+          set -e
+          cd /tmp
+          git clone --depth 1 -b ${{ github.event.inputs.susfs_branch }} \
+            https://github.com/ShirkNeko/susfs4ksu.git susfs || \
+            git clone --depth 1 -b ${{ github.event.inputs.susfs_branch }} \
+            https://github.com/simonpunk/susfs4ksu.git susfs
+          echo "=== SUSFS tree ==="
+          ls -la susfs
+          echo "=== Look for 5.15 kernel patch ==="
+          find susfs -name "*5.15*" -o -name "*.patch" | head -30
+
+      - name: Show SUSFS patch contents
+        run: |
+          cd /tmp/susfs
+          for f in $(find . -name "*.patch" | head -5); do
+            echo "===== $f ====="
+            head -30 "$f"
+          done
+
+      - name: Upload SUSFS inspection
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: susfs-inspect
+          path: /tmp/susfs
+          if-no-files-found: warn
