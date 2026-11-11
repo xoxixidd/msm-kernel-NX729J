@@ -55,7 +55,7 @@ on:
         type: string
         default: ''
       bakasu_ref:
-        description: 'KernelSU(BakaSU)源码版本，留空=拉上游 main tip(每次构建都取最新)。想钉住版本填 tag/提交号/versionCode(如 35193)。versionCode 口径 = 30000 + 提交数 + 700，与管理器一致；反查是精确的(算全部提交的祖先数)，但上游历史有合并 ⇒ 有些数值没有对应提交，这时会明确报错并给出邻近可用值，改用 tag/提交号即可。'
+        description: 'KernelSU 源码版本（SukiSU-Ultra builtin 分支）。留空=拉上游 builtin tip(每次构建都取最新)。想钉住版本填 tag/分支/提交号，例如 v4.3.0-r2 或 builtin 或某个 sha。分支名可用 builtin / main / dev / builtin-new。注意：不再支持填 versionCode —— SukiSU 的版本号口径 (40000+提交数-2815) 与 BakaSU (30000+提交数+700) 不同，填数字会直接报错。'
         required: false
         type: string
         default: ''
@@ -228,15 +228,15 @@ jobs:
           echo "${{ steps.ver.outputs.SCM_VER }}" > .scmversion
           echo "已写入 .scmversion: $(cat .scmversion)"
 
-      - name: 集成 KernelSU (BakaSU)
+      - name: 集成 KernelSU (SukiSU-Ultra builtin)
         id: ksu
         run: |
           # ============================================================
-          # 版本号口径(与上游/管理器完全一致):
-          #   versionCode = 30000 + (git rev-list --count HEAD) + 700 = 30700 + 提交数
-          # 上游 BakaSU/manager 的 build.gradle.kts 就是这么算的，
-          # 上游 CI 每个 release 的**名字**(v35193 之类)也正好是这个 versionCode。
-          # 所以 release 名可以当"版本锚点"用：拿到名字就能反查出上游对应的提交。
+          # 版本号口径（SukiSU-Ultra builtin）:
+          #   KSU_VERSION = 40000 + LOCAL_COUNT - 2815   （kernel/Makefile 里算）
+          #   LOCAL_COUNT 是 git rev-list --count HEAD
+          # 与 BakaSU (30000 + 提交数 + 700) 完全不同，所以不再按 versionCode 反查。
+          # 想钉版本请直接填 tag / 分支名 / 提交号。
           # ============================================================
           REF="${{ inputs.bakasu_ref }}"
           # 允许写成 v35193 —— 但只有「v 后面整串都是数字」才当 versionCode 剥掉 v。
@@ -279,12 +279,18 @@ jobs:
           # 而且 kbuild 的 git diff-index 判 dirty 时也可能要 blob。
           # 这仓库不大，普通克隆多花几秒，换掉这一类不确定性。
           # 也不能加 --single-branch：那样 susfs-dev 之类的开发分支就 checkout 不到了。
-          git clone --quiet https://github.com/Baka-SU/BakaSU KernelSU
+          git clone --quiet -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
           cd KernelSU
           # ★ 改 SELinux domain 名：ksu -> su，避开 Duck Detector 的 context 黑名单
           #   依据：defpackage/ek3.java 的 11 个 context 清单不含 su / su_file
+          #   SukiSU builtin 的 selinux.h 路径与 BakaSU 相同（kernel/selinux/selinux.h），宏名也相同
           sed -i 's/#define KERNEL_SU_DOMAIN "ksu"/#define KERNEL_SU_DOMAIN "su"/' kernel/selinux/selinux.h
           sed -i 's/#define KERNEL_SU_FILE "ksu_file"/#define KERNEL_SU_FILE "su_file"/' kernel/selinux/selinux.h
+          # 必须真的改到，否则等于没改（防上游改了宏的写法）
+          grep -q '#define KERNEL_SU_DOMAIN "su"' kernel/selinux/selinux.h \
+            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_DOMAIN \"ksu\"，上游可能改了写法"; exit 1; }
+          grep -q '#define KERNEL_SU_FILE "su_file"' kernel/selinux/selinux.h \
+            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_FILE \"ksu_file\""; exit 1; }
           grep -n 'KERNEL_SU_DOMAIN\|KERNEL_SU_FILE' kernel/selinux/selinux.h
           # ★ 克隆出来的仓库不一定有本地 main 分支：源仓库 HEAD 处于 detached 状态时
           #   (例如从一个 detached 的本地副本克隆)，git clone 只给 detached HEAD +
@@ -321,88 +327,10 @@ jobs:
               fi
               SRC="upstream ref=$REF"
               ;;
-            *)
-              WANT="$REF"
-              N=$((REF - 30700))
-              [ "$N" -ge 1 ] || { echo "::error::versionCode $REF 不合理(应 > 30700)"; exit 1; }
-              command -v python3 > /dev/null \
-                || { echo "::error::按 versionCode 反查提交需要 python3(用来精确算祖先数，runner 上应当自带)"; exit 1; }
-              # ★ versionCode 的定义 = 30700 + rev-list --count HEAD，即「祖先个数」。
-              #   反查没有便宜的等价做法。三个已经用实测否掉的"聪明办法"记在这里，
-              #   免得以后又被"优化"回去：
-              #   ① 「rev-list --reverse main 的第 N 个」是列表位置，不是 count。
-              #      main 上有 73 个合并提交 ⇒ 实测 69 个取样点里 8 个不等；最极端的
-              #      第 2850 个提交 count 只有 244 —— 会静默解析成一个不相干的版本。
-              #   ② 只在 first-parent 链上二分也不行：链上 count 严格递增、二分本身合法，
-              #      但这个仓库有多条平行的根血脉，侧线上的提交 count 很小却可能是很晚
-              #      才被合并进来的 ⇒ 链上那两个提交夹出的区间罩不到它们。
-              #      （实测 3 个真有提交的靶子，3 个都被假报成"取不到"。）
-              #   ③ count 的取值既不连续(实测 4495 个提交里有 654 个值没有任何提交取到)，
-              #      也会被多个提交共用(652 个值，多为并行的根提交)。
-              #   所以老老实实算全表：拓扑序单遍 + 位集求祖先集并集，一次 rev-list +
-              #   纯内存运算，亚秒级。（逐提交跑 rev-list --count 同样精确，但实测 69 秒，
-              #   且随历史增长是 O(N²)；位集版的两份实现已互相对照过：空洞数/碰撞数/锚点全同。）
-              #   ↓↓↓ 注意下面 python 的缩进：必须正好写在本 run 块的基准缩进(10 空格)处，
-              #       去缩进后落在第 0 列，heredoc 的终止符才认；也不能比 10 空格更浅 ——
-              #       YAML 块标量的内容缩进由第一行决定，更浅的行会直接终止整个 run 块。
-                C=$(python3 - "$N" <<'PY'
-          import subprocess, sys
-          from collections import defaultdict
-
-          want = int(sys.argv[1])
-
-          # 一次 rev-list 拿到 main 全部提交及其父；--topo-order --reverse ⇒ 父必排在子前面
-          r = subprocess.run(['git', 'rev-list', 'main', '--topo-order', '--reverse', '--parents'],
-                             capture_output=True, text=True)
-          if r.returncode:
-              sys.exit('git rev-list 失败: %s' % r.stderr.strip())
-
-          bits, order = {}, []
-          for line in r.stdout.split('\n'):
-              parts = line.split()
-              if not parts:
-                  continue
-              b = 1 << len(order)          # 自己
-              for p in parts[1:]:
-                  b |= bits[p]             # 父的祖先集（拓扑序保证父已经算过）
-              bits[parts[0]] = b
-              order.append(parts[0])
-
-          total = len(order)
-          if total > 60000:
-              sys.exit('main 已有 %d 个提交，位集全表占内存过大；请改用 tag 或提交号' % total)
-
-          # count = 祖先数(含自己)，与 versionCode 同口径
-          byn = defaultdict(list)
-          for s in order:                  # order 是"从旧到新"，故 byn[k][-1] 是拓扑上最新的
-              byn[bin(bits[s]).count('1')].append(s)
-          hi = max(byn)
-
-          print('  main 提交数 = %d，count 最大值 = %d' % (total, hi), file=sys.stderr)
-
-          hits = byn.get(want)
-          if not hits:
-              print('  ✗ 上游 main 里没有任何提交的 count 等于 %d（versionCode %d）' % (want, want + 30700),
-                    file=sys.stderr)
-              lo = [k for k in range(want - 1, 0, -1) if k in byn]
-              up = [k for k in range(want + 1, hi + 1) if k in byn]
-              if lo:
-                  print('    往下的最近可用值: versionCode %d' % (lo[0] + 30700), file=sys.stderr)
-              if up:
-                  print('    往上的最近可用值: versionCode %d' % (up[0] + 30700), file=sys.stderr)
-              print('    有合并的历史就会这样：上游 %d 个 count 值里有 %d 个没有任何提交取到'
-                    % (hi, sum(1 for k in range(1, hi + 1) if k not in byn)), file=sys.stderr)
-              sys.exit(0)                  # 空输出 ⇒ 让外层报 ::error（别在这里非零退出，
-                                           #   那会被 set -e 直接掐掉，日志里就没有 ::error 了）
-          if len(hits) > 1:
-              print('  ⚠ 有 %d 个提交的 count 都等于 %d（并行血脉），取拓扑上最新的那个；全部: %s'
-                    % (len(hits), want, ' '.join(s[:12] for s in hits)), file=sys.stderr)
-          print(hits[-1])
-          PY
-              )
-              [ -n "$C" ] || { echo "::error::上游 main 里没有 versionCode $REF 对应的提交，原因见上面的诊断"; echo "::error::bakasu_ref 也可以直接填 tag 或提交号"; exit 1; }
-              git checkout --quiet "$C"
-              SRC="upstream versionCode $REF ⇒ 提交 $(git rev-parse --short=12 "$C")"
+            *)  # 既不是 latest/main/HEAD，也不是 tag/分支（走不到这里，兜底报错）
+              echo "::error::无法识别的 ref: $REF"
+              echo "::error::可填：留空（取 builtin tip）/ tag（如 v4.3.0-r2）/ 分支名（builtin、main、dev）/ 提交号"
+              exit 1
               ;;
           esac
           V=$(git rev-list --count HEAD)
@@ -410,20 +338,18 @@ jobs:
           SHA=$(git rev-parse --short=8 HEAD)
           cd ..
 
-          KSUVER=$((30000 + V + 700))
+          # SukiSU-Ultra: KSU_VERSION = 40000 + LOCAL_COUNT - 2815（与 kernel/Makefile 同口径）
+          KSUVER=$((40000 + V - 2815))
 
-          # 给了 versionCode 就必须自洽：反查到的提交，其 rev-list 计数要能算出同一个数。
-          # 这条挡的是"上游改了计数方式/我们把 N 算错了"这类错配。
-          if [ -n "$WANT" ] && [ "$KSUVER" != "$WANT" ]; then
-            echo "::error::版本号自洽性检查失败: 期望 $WANT，由提交数算出来是 $KSUVER"
-            exit 1
-          fi
-          [ "$KSUVER" -gt 30700 ] || { echo "::error::版本号异常: $KSUVER"; exit 1; }
+          # SukiSU 口径的范围检查：40000 + count - 2815，正常应 > 38000
+          [ "$KSUVER" -gt 38000 ] || { echo "::error::版本号异常: $KSUVER（SukiSU 口径应 > 38000）"; exit 1; }
 
           # 接线完整性：软链接必须是软链接(内核是从 drivers/kernelsu 进 KSU 源码的)
           [ -L drivers/kernelsu ] || { echo "::error::drivers/kernelsu 不是软链接，接线被改坏了"; exit 1; }
-          [ -f KernelSU/kernel/Kbuild ] || { echo "::error::KernelSU/kernel/Kbuild 不存在（若填的是 versionCode 或很老的 tag，多半是解析出来的提交太老 —— 那时 KernelSU 还不是这个目录布局，内核侧的接线也对不上）"; exit 1; }
-          [ -f KernelSU/kernel/core/init.c ] || { echo "::error::KernelSU 源码不完整(缺 core/init.c)"; exit 1; }
+          # SukiSU builtin 的布局：kernel/Makefile（不是 Kbuild）+ kernel/ksu_main.c（不是 core/init.c）
+          [ -f KernelSU/kernel/Makefile ] || { echo "::error::KernelSU/kernel/Makefile 不存在 —— SukiSU 的布局与 BakaSU 不同，检查 clone 是否拿到了 builtin 分支"; exit 1; }
+          [ -f KernelSU/kernel/ksu_main.c ] || { echo "::error::KernelSU 源码不完整(缺 ksu_main.c)"; exit 1; }
+          [ -f KernelSU/kernel/selinux/selinux.h ] || { echo "::error::缺 kernel/selinux/selinux.h"; exit 1; }
 
           echo "KernelSU 来源   : $SRC"
           echo "KernelSU 提交   : $SHA  ($TAG)"
@@ -718,7 +644,8 @@ jobs:
           # 它只在 kbuild 真的下降到 drivers/kernelsu/(即 CONFIG_KSU=y) 时才打印 ⇒ 是「真参与了编译」的证据，
           # 不是从 .config 反推出来的。
           KSU_WANT="${{ steps.ksu.outputs.KSUVER }}"
-          KSU_GOT=$(grep -oE 'version code: [0-9]+' build.log 2>/dev/null | awk '{print $NF}' | sort -u | tr '\n' ' ') || true
+          # SukiSU 的 kernel/Makefile 打印格式: $(info -- SukiSU-Ultra version: N [vX.Y.Z-sha@branch])
+          KSU_GOT=$(grep -oE 'SukiSU-Ultra version: [0-9]+' build.log 2>/dev/null | awk '{print $NF}' | sort -u | tr '\n' ' ') || true
           echo "  期望版本号: $KSU_WANT"
           echo "  build.log 里打印的版本号: ${KSU_GOT:-（无）}"
           case " $KSU_GOT " in
@@ -727,14 +654,14 @@ jobs:
                echo "::error::（打印为空 ⇒ CONFIG_KSU 没生效, 或 kbuild 没下降到 drivers/kernelsu）"
                exit 1 ;;
           esac
-          for f in out/drivers/kernelsu/built-in.a out/drivers/kernelsu/core/init.o out/drivers/kernelsu/selinux/selinux.o; do
+          for f in out/drivers/kernelsu/built-in.a out/drivers/kernelsu/ksu_main.o out/drivers/kernelsu/selinux/selinux.o; do
             [ -s "$f" ] || { echo "::error::缺 KernelSU 目标文件: $f"; exit 1; }
           done
           echo "  ✓ KernelSU $KSU_WANT 已编入 (目标文件齐全)"
-          if strings -a out/arch/arm64/boot/Image | grep -q 'BakaSU'; then
-            echo "  ✓ Image 内含 BakaSU 字面量"
+          if strings -a out/arch/arm64/boot/Image | grep -q 'SukiSU-Ultra'; then
+            echo "  ✓ Image 内含 SukiSU-Ultra 字面量"
           else
-            echo "  ⚠ Image 里没找到 BakaSU 字面量 (仅提示, 不作为失败判据)"
+            echo "  ⚠ Image 里没找到 SukiSU-Ultra 字面量 (仅提示, 不作为失败判据)"
           fi
           cp out/.config ./compiled.config
           echo "ccache 状态:"; ccache -s
@@ -916,8 +843,8 @@ jobs:
           # 包名带上 KSU 版本号：不刷机也能一眼看出这个 zip 装的是哪版 BakaSU
           # （KSUVER 由「集成 KernelSU」那步写进 GITHUB_ENV；:? 是为了万一没设置就立刻报出来，
           #   而不是生成一个 ...-BakaSU-.zip 这种名字）
-          : "${KSUVER:?KSUVER 未设置 —— 「集成 KernelSU (BakaSU)」那步没跑或没导出}"
-          AK3_NAME="AnyKernel3-NX729J-$VER_ACTUAL-BakaSU-$KSUVER.zip"
+          : "${KSUVER:?KSUVER 未设置 —— 「集成 KernelSU (SukiSU-Ultra builtin)」那步没跑或没导出}"
+          AK3_NAME="AnyKernel3-NX729J-$VER_ACTUAL-SukiSU-$KSUVER.zip"
           zip -r9 "../$AK3_NAME" ./* -x '*.git*'
           echo "ak3name=$AK3_NAME" >> "$GITHUB_OUTPUT"
           echo "=== 刷机包已生成: $AK3_NAME ==="
@@ -943,12 +870,12 @@ jobs:
           [ -n "$VER_ACTUAL" ] || VER_ACTUAL="${{ steps.ver.outputs.VERSION_FULL }}"
           TAG="NX729J-build-$(TZ=Asia/Shanghai date +%y%m%d%H%M)"
           cat > release_body.md <<EOF
-          ### 📱 红魔8S Pro (NX729J) BakaSU 通用内核 | 构建信息
+          ### 📱 红魔8S Pro (NX729J) SukiSU-Ultra 通用内核 | 构建信息
 
           * 内核版本号: ${VER_ACTUAL}
           * 编译时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (CST)
           * 机型：红魔8S Pro (NX729J) 通用 ${{ steps.ver.outputs.VERSION_TAG }} GKI 2.0 内核（${{ steps.ver.outputs.RELEASE_BASE }}）
-          * KSU分支：BakaSU (版本号 ${KSUVER}，上游提交 ${{ steps.ksu.outputs.KSUSHA }}，来源：${{ steps.ksu.outputs.KSUSRC }})
+          * KSU分支：SukiSU-Ultra builtin (版本号 ${KSUVER}，上游提交 ${{ steps.ksu.outputs.KSUSHA }}，来源：${{ steps.ksu.outputs.KSUSRC }})
           * susfs支持：${{ steps.ver.outputs.SUSFS }}
           * LZ4支持：${{ steps.ver.outputs.LZ4 }}
           * 网络功能增强：${{ steps.ver.outputs.NETWORK }}
@@ -956,7 +883,7 @@ jobs:
           * Droidspaces 容器支持：${{ steps.ver.outputs.DROIDSPACES }}
           * 内核级基带保护支持：${{ steps.ver.outputs.BBG }}
           * eBPF支持（daed 所需 BPF/JIT/BTF/IKHEADERS）：${{ steps.ver.outputs.EBPF }}
-          * BakaSU管理器下载：[BakaSU](https://github.com/Baka-SU/BakaSU/releases)
+          * SukiSU管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
 
           #### ※※※ 刷写内核有风险，可能导致无法开机、WIFI/指纹/基带异常等。刷写前务必备份 boot 分区（TWRP 或 Android 工具箱）。刷入后如遇问题请回刷官方 boot.img。※※※
           EOF
