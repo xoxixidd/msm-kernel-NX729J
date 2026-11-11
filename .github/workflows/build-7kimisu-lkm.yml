@@ -69,34 +69,57 @@ jobs:
           fi
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
 
+      - name: 装 libelf-dev（绕过 apt，IP 直连 .deb）
+        run: |
+          set -e
+          # ── 为什么不用 apt ────────────────────────────────────────────────
+          # runner 的 apt 源 azure.archive.ubuntu.com 整个 job 期间解析失败，
+          # 连 archive.ubuntu.com / security.ubuntu.com 也一起失败（见历次日志）。
+          # 但 Ubuntu 官方 archive 的 IP 是通的，直接 curl .deb 绕过 mirror 逻辑。
+          # ──────────────────────────────────────────────────────────────────
+          if [ -f /usr/include/libelf.h ] && [ -f /usr/include/elfutils/libdw.h ]; then
+            echo "libelf-dev / libdw-dev 已存在，跳过"
+            dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version)' || true
+            exit 0
+          fi
+
+          MIRROR="http://91.189.91.81/ubuntu"
+          TMP=$(mktemp -d)
+          cd "$TMP"
+
+          fetch() {
+            echo "下载 $1"
+            curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -O "$MIRROR/$1" \
+              || { echo "::error::下载失败 $MIRROR/$1"; exit 1; }
+          }
+
+          fetch "pool/main/e/elfutils/libelf-dev_0.190-1.1ubuntu0.1_amd64.deb"
+          fetch "pool/main/e/elfutils/libdw-dev_0.190-1.1ubuntu0.1_amd64.deb"
+
+          echo "=== dpkg -i ==="
+          sudo dpkg -i ./*.deb || {
+            echo "::warning::dpkg 报依赖问题，尝试补齐（apt 可能失败，但不影响已解包的头文件）"
+            sudo apt-get install -f -y || true
+          }
+
+          echo "=== 校验 ==="
+          ls -l /usr/include/libelf.h /usr/include/elfutils/libdw.h 2>/dev/null || {
+            echo "::error::libelf.h / libdw.h 仍未就位"
+            exit 1
+          }
+          dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version|Status)' || true
+
       - name: 检查工具链（不装包）
         run: |
-          # 这步不跑 apt —— 本流程只编一个外部模块，不需要 pahole/BTF 那套。
-          # runner 的 DNS 挂掉时 apt 必然失败，直接跳过。
-          # 缺什么在下面编译步骤会明确报出来。
-          echo "=== 现有工具 ==="
           MISSING=""
-          for t in make gcc clang python3 git tar curl flex bison bc bzip2 lz4 zstd cpio; do
+          for t in make gcc clang python3 git tar curl flex bison bc bzip2 lz4 cpio; do
             printf '  %-10s ' "$t"
-            if command -v "$t" >/dev/null 2>&1; then
-              echo "OK"
-            else
-              echo "缺失"
-              MISSING="$MISSING $t"
-            fi
+            if command -v "$t" >/dev/null 2>&1; then echo OK; else echo "缺失"; MISSING="$MISSING $t"; fi
           done
-          echo "=== 缺失清单:$MISSING ==="
-          # flex / bison / bc 是编内核 scripts/dtc 和 Kconfig 的硬依赖
+          echo "缺失:$MISSING"
           for hard in flex bison bc; do
-            echo "$MISSING" | grep -qw "$hard" && {
-              echo "::error::缺少硬依赖 $hard —— 内核编译脚本需要它，且 runner 的 apt DNS 挂着装不上"
-              exit 1
-            }
+            echo "$MISSING" | grep -qw "$hard" && { echo "::error::缺少硬依赖 $hard"; exit 1; }
           done
-          echo "=== OPTIONAL（本流程不需要）==="
-          command -v ccache >/dev/null 2>&1 && echo "  ccache   有（会加速）" || echo "  ccache   无（不影响）"
-          command -v pahole >/dev/null 2>&1 && echo "  pahole   有" || echo "  pahole   无（不需要 BTF）"
-
       - name: 下载 AOSP clang
         run: |
           set -e
@@ -196,22 +219,49 @@ jobs:
           grep -E '^CONFIG_(KSU|MODULES|KPROBES|MODVERSIONS|MODULE_SIG_FORCE|MODULE_FORCE_LOAD)=' out/.config || true
           grep -q '^CONFIG_KSU=m' out/.config || { echo "::error::CONFIG_KSU 没设成 m"; grep KSU out/.config | head; exit 1; }
 
-      - name: 编译内核（modules_prepare）
+      - name: 准备 swap（FullLTO 链接内存峰值兜底）
+        run: |
+          set -e
+          # FullLTO 链接 vmlinux 时内存峰值很高，runner 的 7G 内存不够会 OOM 被杀
+          echo "=== 内存与磁盘 ==="
+          free -h || true
+          df -h / | tail -1 || true
+          if [ ! -f /swapfile ]; then
+            sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+          fi
+          sudo swapon /swapfile || true
+          echo "=== swap 就绪 ==="
+          free -h || true
+
+      - name: 编译内核+模块（生成 Module.symvers）
         working-directory: kernel-tree
         run: |
           export PATH="$CLANG_DIR:$PATH"
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
-          echo "=== modules_prepare ==="
-          # 不用管道，直接落日志：管道会吃掉 make 的退出码，tail 还会截掉真错误
-          if make O=out ARCH=arm64 LLVM=1 modules_prepare -j$(nproc) > /tmp/mp.log 2>&1; then
-            echo "modules_prepare 成功"
+          # ★ 不再用 modules_prepare —— 它不生成 Module.symvers。
+          #   本机 CONFIG_MODVERSIONS=y，模块必须带正确的符号 CRC 才能加载，
+          #   而 Module.symvers 只有完整编过内核（链接出 vmlinux）才生成。
+          #   所以这里直接编 modules，kbuild 会自动先建 vmlinux 再编模块。
+          echo "=== 编译内核 + 模块（会先链接 vmlinux 生成 Module.symvers）==="
+          if make O=out ARCH=arm64 LLVM=1 -j$(nproc) > /tmp/mp.log 2>&1; then
+            echo "内核+模块编译成功"
           else
             RC=$?
-            echo "::error::modules_prepare 失败（rc=$RC），错误尾部如下"
-            grep -iE "error|错误|No such file|command not found|not found" /tmp/mp.log | tail -40 || true
+            echo "::error::编译失败（rc=$RC）"
+            grep -iE "error:|错误|No such file|command not found|fatal" /tmp/mp.log | tail -40 || true
             echo "──── 完整尾部 60 行 ────"
             tail -60 /tmp/mp.log
+            exit 1
+          fi
+          echo "=== 检查 Module.symvers ==="
+          if [ -s out/Module.symvers ]; then
+            echo "  Module.symvers 存在，$(wc -l < out/Module.symvers) 条符号"
+            head -3 out/Module.symvers
+          else
+            echo "::error::没有 Module.symvers，模块加载会因符号 CRC 缺失失败"
             exit 1
           fi
           echo "=== 本机 vermagic 期望值 ==="
@@ -221,37 +271,23 @@ jobs:
           # modules_prepare 不会生成 Module.symvers，需要注意
           ls -l out/Module.symvers 2>/dev/null || echo "(没有 Module.symvers，外部模块可能报 undefined symbol)"
 
-      - name: 编译 7kimisu 模块
-        working-directory: KernelSU/kernel
+      - name: 确认 kernelsu.ko 产出
+        working-directory: kernel-tree
         run: |
           set -e
-          export PATH="$CLANG_DIR:$PATH"
-          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
-          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
-          KTREE="$GITHUB_WORKSPACE/kernel-tree"
-          echo "=== 方案 A：7kimisu 自己的 Makefile（KDIR 指向内核树）==="
-          if make KDIR="$KTREE" CONFIG_KSU=m CC="clang" -j$(nproc) > /tmp/mk.log 2>&1; then
-            echo "方案 A 成功"
-          else
-            echo "方案 A 失败，尾部 40 行："
-            tail -40 /tmp/mk.log || true
-            echo ""
-            echo "=== 方案 B：直接 kbuild（M= + O=）==="
-            if make -C "$KTREE" M="$PWD" src="$PWD" O="$KTREE/out" \
-                 ARCH=arm64 LLVM=1 CONFIG_KSU=m modules -j$(nproc) > /tmp/kb.log 2>&1; then
-              echo "方案 B 成功"
-            else
-              echo "方案 B 也失败，尾部 40 行："
-              tail -40 /tmp/kb.log || true
-              echo "──── 方案A 的完整错误 ────"
-              grep -iE "error|Error|No such|not found|undefined" /tmp/mk.log | tail -30 || true
-              exit 1
-            fi
+          echo "=== 在 out/ 里找 kernelsu.ko ==="
+          find out -name "kernelsu.ko" -o -name "kernelsu.ko.*" 2>/dev/null | head -10
+          KO=$(find out -name "kernelsu.ko" 2>/dev/null | head -1)
+          if [ -z "$KO" ]; then
+            echo "::error::完整编译后仍没有 kernelsu.ko —— 可能 CONFIG_KSU 没生效"
+            grep -E '^CONFIG_KSU' out/.config || echo "(config 里没有 CONFIG_KSU)"
+            ls out/drivers/kernelsu/ 2>/dev/null || echo "(out/drivers/kernelsu 不存在)"
+            exit 1
           fi
-          echo "=== 找产物 ==="
-          find . -name "*.ko" 2>/dev/null | head -20
-          echo "=== 内核树里的产物 ==="
-          find "$KTREE/out" -name "kernelsu*" 2>/dev/null | head -10 || true
+          echo "找到: $KO"
+          ls -l "$KO"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$KO" "$GITHUB_WORKSPACE/artifacts/kernelsu.ko"
 
       - name: 校验 vermagic
         run: |
