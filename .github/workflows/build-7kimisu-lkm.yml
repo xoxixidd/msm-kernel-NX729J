@@ -69,27 +69,20 @@ jobs:
           fi
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
 
-      - name: 安装依赖（最小化，先查后装）
+      - name: 检查工具链（不装包）
         run: |
-          set -e
-          # ubuntu-latest 镜像自带 build-essential / bc / bison / flex /
-          # libssl-dev / libelf-dev / zip / curl，不用重装。
-          # 真正可能缺的只有这三个：pahole(dwarves) / ccache / libdw-dev
-          NEED=""
-          command -v pahole >/dev/null 2>&1        || NEED="$NEED dwarves"
-          command -v ccache >/dev/null 2>&1        || NEED="$NEED ccache"
-          dpkg -s libdw-dev >/dev/null 2>&1        || NEED="$NEED libdw-dev"
-          if [ -z "$NEED" ]; then
-            echo "依赖已齐，跳过 apt（ubuntu-latest 镜像自带）"
-          else
-            echo "需要安装:$NEED"
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends $NEED
-          fi
-          echo "=== 版本确认 ==="
-          gcc --version | head -n1 || true
-          pahole --version 2>/dev/null || echo "pahole 未装（不需要 BTF 时可忽略）"
-          ccache --version 2>/dev/null | head -n1 || true
+          # 这步不跑 apt —— 本流程只编一个外部模块，不需要 pahole/BTF 那套。
+          # runner 的 DNS 挂掉时 apt 必然失败，直接跳过。
+          # 缺什么在下面编译步骤会明确报出来。
+          echo "=== 现有工具 ==="
+          for t in make gcc clang python3 git tar curl; do
+            printf '  %-10s ' "$t"
+            command -v "$t" >/dev/null 2>&1 && echo "OK ($(command -v $t))" || echo "缺失"
+          done
+          echo "=== OPTIONAL（本流程不需要）==="
+          command -v ccache >/dev/null 2>&1 && echo "  ccache   有（会加速）" || echo "  ccache   无（不影响）"
+          command -v pahole >/dev/null 2>&1 && echo "  pahole   有" || echo "  pahole   无（不需要 BTF）"
+
       - name: 下载 AOSP clang
         run: |
           set -e
