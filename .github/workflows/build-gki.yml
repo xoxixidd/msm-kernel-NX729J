@@ -256,7 +256,7 @@ jobs:
           TAG=''
           SHA=''
 
-          # 默认留空 ⇒ 拉上游 main tip(每次构建都自动取最新)。
+          # 默认留空 ⇒ 拉上游 builtin tip(每次构建都自动取最新)。builtin 才有 SUSFS。
           if [ -z "$REF" ]; then REF=latest; fi
           # 仓库已不再附带 KernelSU 源码（见 README「构建方式二」第 2 步），vendored 模式取消。
           # 显式填这两个词时给明确报错，而不是让它掉进下面的 tag 分支报「没有这个 tag」。
@@ -281,17 +281,7 @@ jobs:
           # 也不能加 --single-branch：那样 susfs-dev 之类的开发分支就 checkout 不到了。
           git clone --quiet -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
           cd KernelSU
-          # ★ 改 SELinux domain 名：ksu -> su，避开 Duck Detector 的 context 黑名单
-          #   依据：defpackage/ek3.java 的 11 个 context 清单不含 su / su_file
-          #   SukiSU builtin 的 selinux.h 路径与 BakaSU 相同（kernel/selinux/selinux.h），宏名也相同
-          sed -i 's/#define KERNEL_SU_DOMAIN "ksu"/#define KERNEL_SU_DOMAIN "su"/' kernel/selinux/selinux.h
-          sed -i 's/#define KERNEL_SU_FILE "ksu_file"/#define KERNEL_SU_FILE "su_file"/' kernel/selinux/selinux.h
-          # 必须真的改到，否则等于没改（防上游改了宏的写法）
-          grep -q '#define KERNEL_SU_DOMAIN "su"' kernel/selinux/selinux.h \
-            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_DOMAIN \"ksu\"，上游可能改了写法"; exit 1; }
-          grep -q '#define KERNEL_SU_FILE "su_file"' kernel/selinux/selinux.h \
-            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_FILE \"ksu_file\""; exit 1; }
-          grep -n 'KERNEL_SU_DOMAIN\|KERNEL_SU_FILE' kernel/selinux/selinux.h
+          # domain 改名（sed）挪到 checkout 之后做 —— 见下方「改 SELinux domain 名」段
           # ★ 克隆出来的仓库不一定有本地 main 分支：源仓库 HEAD 处于 detached 状态时
           #   (例如从一个 detached 的本地副本克隆)，git clone 只给 detached HEAD +
           #   refs/remotes/origin/main，本地 main 不存在。这时后面那句
@@ -304,12 +294,22 @@ jobs:
             git branch --quiet main refs/remotes/origin/main
             echo "  (克隆里没有本地 main，已按 origin/main 补建)"
           fi
+          # ★ SukiSU 的关键差异：只有 builtin 分支带 CONFIG_KSU_SUSFS 及子选项，
+          #   main 分支是 kprobe 方案（无 SUSFS 配置项）。本项目要 SUSFS，默认走 builtin。
           case "$REF" in
-            latest|main|HEAD)
+            latest|HEAD)
+              git rev-parse --verify --quiet 'builtin^{commit}' > /dev/null \
+                || git rev-parse --verify --quiet 'refs/remotes/origin/builtin^{commit}' > /dev/null \
+                || { echo "::error::上游没有 builtin 分支（SukiSU 的 SUSFS 只在 builtin 分支，请检查上游是否改名）"; exit 1; }
+              git checkout --quiet builtin
+              SRC="upstream builtin tip(每次构建都取最新，含 SUSFS 配置)"
+              ;;
+            main)
               git rev-parse --verify --quiet 'main^{commit}' > /dev/null \
                 || { echo "::error::上游没有 main 分支(改名了?)"; exit 1; }
               git checkout --quiet main
-              SRC="upstream main tip(每次构建都取最新)"
+              echo "::warning::选了 main 分支 —— SukiSU 的 main 是 kprobe 方案，不含 CONFIG_KSU_SUSFS，本项目的 SUSFS 将不可用"
+              SRC="upstream main tip（注意：无 SUSFS 配置项）"
               ;;
             *[!0-9]*)
               # ★ 必须先显式验 ref 存在：git checkout 失败若只靠 shell 的 -e 兜，
@@ -333,6 +333,25 @@ jobs:
               exit 1
               ;;
           esac
+
+          # ★ 改 SELinux domain 名：ksu -> su，避开 Duck Detector 的 context 黑名单
+          #   依据：defpackage/ek3.java 的 11 个 context 清单不含 su / su_file
+          #   SukiSU builtin 的 selinux.h 路径与 BakaSU 相同（kernel/selinux/selinux.h），宏名也相同
+          #
+          #   位置很关键：必须在 case/esac 之后 —— 因为 REF=latest 会 git checkout main，
+          #   若先 sed 再 checkout，git 会因「本地有未提交改动」拒绝切换而失败。
+          cd KernelSU
+          sed -i 's/#define KERNEL_SU_DOMAIN "ksu"/#define KERNEL_SU_DOMAIN "su"/' kernel/selinux/selinux.h
+          sed -i 's/#define KERNEL_SU_FILE "ksu_file"/#define KERNEL_SU_FILE "su_file"/' kernel/selinux/selinux.h
+          # 必须真的改到，否则等于没改（防上游改了宏的写法）
+          grep -q '#define KERNEL_SU_DOMAIN "su"' kernel/selinux/selinux.h \
+            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_DOMAIN \"ksu\"，上游可能改了写法"; exit 1; }
+          grep -q '#define KERNEL_SU_FILE "su_file"' kernel/selinux/selinux.h \
+            || { echo "::error::domain 改名失败：selinux.h 里没找到 KERNEL_SU_FILE \"ksu_file\""; exit 1; }
+          grep -n 'KERNEL_SU_DOMAIN\|KERNEL_SU_FILE' kernel/selinux/selinux.h
+          cd ..
+          # （checkout 在 case 块里做，这里已在目标提交上，改完不会被覆盖）
+
           V=$(git rev-list --count HEAD)
           TAG=$(git describe --abbrev=0 --tags 2>/dev/null || echo unknown)
           SHA=$(git rev-parse --short=8 HEAD)
