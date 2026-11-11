@@ -27,7 +27,7 @@ env:
 
 jobs:
   build-lkm:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
@@ -69,26 +69,83 @@ jobs:
           fi
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
 
-      - name: 安装依赖（带重试，apt DNS 会瞬时挂）
+      - name: 配置 apt（抗 DNS 失败）
         run: |
           set -e
-          # GitHub runner 的 apt 源 DNS 偶发失败（Temporary failure resolving azure.archive.ubuntu.com）
-          # 循环重试，最多 3 次
-          for i in 1 2 3; do
-            echo "=== apt 尝试 $i ==="
-            if sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-                 binutils python-is-python3 libssl-dev libelf-dev libdw-dev bc dwarves \
-                 ccache zip unzip git curl; then
-              echo "apt 成功"
-              break
-            fi
-            if [ "$i" = "3" ]; then
-              echo "::error::apt 连续 3 次失败"
-              exit 1
-            fi
-            echo "apt 失败，等 15 秒重试"
-            sleep 15
+          # ── 为什么要有这步 ────────────────────────────────────────────────
+          # GitHub runner 的 apt 源指向 azure.archive.ubuntu.com，该域名会整个
+          # job 期间解析失败（Temporary failure resolving）。apt 默认对同一个
+          # mirror 重试 3 次、每次等 120 秒超时，一条目就要 4 分钟，装十几个包
+          # 直接撞掉 20 分钟还不报错。
+          #
+          # 对策三条（都有社区实证）：
+          #   ① 超时压到 20 秒     —— THRIFT-6234
+          #   ② Retries 设 0       —— 让 apt 快速跳到下一个 mirror（源列表本身有 3 个）
+          #   ③ ForceIPv4          —— spiceai #10349，绕开 IPv6 解析异常
+          #   ④ 源换 IP 直连        —— AutoBot #21330，DNS 挂了也能用
+          # ──────────────────────────────────────────────────────────────────
+          sudo tee /etc/apt/apt.conf.d/99-ci-tune >/dev/null <<'EOF'
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          Acquire::ftp::Timeout "20";
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "0";
+          DPkg::Lock::Timeout "120";
+          EOF
+
+          # 把解析不了的域名换成 IP（Ubuntu 官方 archive/security 的 anycast IP）
+          echo "=== 改前 ==="
+          grep -rhoE 'https?://[a-z0-9.-]*ubuntu\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sort -u || true
+
+          sudo sed -i \
+            -e 's|http://azure\.archive\.ubuntu\.com|http://91.189.91.81|g' \
+            -e 's|http://archive\.ubuntu\.com|http://91.189.91.81|g' \
+            -e 's|https://archive\.ubuntu\.com|http://91.189.91.81|g' \
+            -e 's|http://security\.ubuntu\.com|http://91.189.91.82|g' \
+            -e 's|https://security\.ubuntu\.com|http://91.189.91.82|g' \
+            /etc/apt/sources.list 2>/dev/null || true
+          # noble 起用 deb822 格式（*.sources），也要改
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i \
+              -e 's|http://azure\.archive\.ubuntu\.com|http://91.189.91.81|g' \
+              -e 's|http://archive\.ubuntu\.com|http://91.189.91.81|g' \
+              -e 's|https://archive\.ubuntu\.com|http://91.189.91.81|g' \
+              -e 's|http://security\.ubuntu\.com|http://91.189.91.82|g' \
+              -e 's|https://security\.ubuntu\.com|http://91.189.91.82|g' \
+              "$f" || true
           done
+
+          echo "=== 改后 ==="
+          grep -rhoE 'https?://[0-9.]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sort -u || true
+          echo "=== apt 配置 ==="
+          cat /etc/apt/apt.conf.d/99-ci-tune
+
+      - name: 安装依赖
+        run: |
+          set -e
+          # 先查有没有，缺的才装
+          NEED=""
+          for pkg in binutils python3 libssl-dev libelf-dev bc zip unzip git curl; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || NEED="$NEED $pkg"
+          done
+          command -v ccache  >/dev/null 2>&1 || NEED="$NEED ccache"
+          command -v pahole  >/dev/null 2>&1 || NEED="$NEED dwarves"
+          dpkg -s libdw-dev >/dev/null 2>&1 || NEED="$NEED libdw-dev"
+          if [ -n "$NEED" ]; then
+            echo "需要安装:$NEED"
+            for i in 1 2; do
+              echo "--- apt 第 $i 轮 ---"
+              if sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=20 \
+                 && sudo apt-get install -y --no-install-recommends $NEED; then
+                echo "依赖安装成功"; break
+              fi
+              [ "$i" = "2" ] && { echo "::error::依赖安装失败"; exit 1; }
+              echo "重试中..."; sleep 5
+            done
+          else
+            echo "依赖已齐，跳过 apt install"
+          fi
 
       - name: 下载 AOSP clang
         run: |
