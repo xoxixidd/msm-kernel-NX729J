@@ -69,57 +69,84 @@ jobs:
           fi
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) ' Makefile
 
-      - name: 装 libelf-dev（绕过 apt，IP 直连 .deb）
+      - name: 装编译依赖（绕过 apt，IP 直连 .deb）
         run: |
           set -e
           # ── 为什么不用 apt ────────────────────────────────────────────────
           # runner 的 apt 源 azure.archive.ubuntu.com 整个 job 期间解析失败，
-          # 连 archive.ubuntu.com / security.ubuntu.com 也一起失败（见历次日志）。
-          # 但 Ubuntu 官方 archive 的 IP 是通的，直接 curl .deb 绕过 mirror 逻辑。
+          # archive/security.ubuntu.com 也跟着失败（历次日志实证）。
+          # 但官方 archive 的 IP 是通的，直接 curl .deb 绕过 mirror 逻辑。
+          #
+          # 包清单来自 apt 自己报的 "The following NEW packages will be installed"：
+          #   libelf-dev libdw-dev liblzma-dev ccache dwarves(pahole) libhiredis1.1.0
+          # 合计 1.43 MB
           # ──────────────────────────────────────────────────────────────────
-          if [ -f /usr/include/libelf.h ] && [ -f /usr/include/elfutils/libdw.h ]; then
-            echo "libelf-dev / libdw-dev 已存在，跳过"
-            dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version)' || true
-            exit 0
+          check_all() {
+            [ -f /usr/include/libelf.h ] || return 1
+            [ -f /usr/include/elfutils/libdw.h ] || return 1
+            command -v ccache >/dev/null 2>&1 || return 1
+            command -v pahole >/dev/null 2>&1 || return 1
+            return 0
+          }
+
+          if check_all; then
+            echo "依赖已齐，跳过下载"
+          else
+            MIRROR="http://91.189.91.81/ubuntu"
+            TMP=$(mktemp -d); cd "$TMP"
+
+            for p in \
+              pool/main/e/elfutils/libelf-dev_0.190-1.1ubuntu0.1_amd64.deb \
+              pool/main/e/elfutils/libdw-dev_0.190-1.1ubuntu0.1_amd64.deb \
+              pool/main/x/xz-utils/liblzma-dev_5.6.1+really5.4.5-1ubuntu0.4_amd64.deb \
+              pool/universe/c/ccache/ccache_4.9.1-1_amd64.deb \
+              pool/universe/d/dwarves/dwarves_1.25-0ubuntu3_all.deb \
+              pool/universe/d/dwarves/pahole_1.25-0ubuntu3_amd64.deb \
+              pool/universe/h/hiredis/libhiredis1.1.0_1.2.0-6ubuntu3_amd64.deb
+            do
+              echo "  下载 $(basename "$p")"
+              curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -O "$MIRROR/$p" \
+                || { echo "::error::下载失败 $p"; exit 1; }
+            done
+
+            echo "=== dpkg -i ==="
+            sudo dpkg -i ./*.deb || {
+              echo "::warning::dpkg 报依赖问题（通常是 libelf1/libdw1 运行时包），尝试补齐"
+              sudo apt-get install -f -y || true
+            }
           fi
 
-          MIRROR="http://91.189.91.81/ubuntu"
-          TMP=$(mktemp -d)
-          cd "$TMP"
-
-          fetch() {
-            echo "下载 $1"
-            curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -O "$MIRROR/$1" \
-              || { echo "::error::下载失败 $MIRROR/$1"; exit 1; }
-          }
-
-          fetch "pool/main/e/elfutils/libelf-dev_0.190-1.1ubuntu0.1_amd64.deb"
-          fetch "pool/main/e/elfutils/libdw-dev_0.190-1.1ubuntu0.1_amd64.deb"
-
-          echo "=== dpkg -i ==="
-          sudo dpkg -i ./*.deb || {
-            echo "::warning::dpkg 报依赖问题，尝试补齐（apt 可能失败，但不影响已解包的头文件）"
-            sudo apt-get install -f -y || true
-          }
-
           echo "=== 校验 ==="
-          ls -l /usr/include/libelf.h /usr/include/elfutils/libdw.h 2>/dev/null || {
-            echo "::error::libelf.h / libdw.h 仍未就位"
-            exit 1
-          }
-          dpkg -s libelf-dev 2>/dev/null | grep -E '^(Package|Version|Status)' || true
+          for f in /usr/include/libelf.h /usr/include/elfutils/libdw.h; do
+            [ -f "$f" ] && echo "  OK $f" || echo "  MISSING $f"
+          done
+          command -v ccache && ccache --version | head -n1
+          command -v pahole && pahole --version
 
       - name: 检查工具链（不装包）
         run: |
           MISSING=""
           for t in make gcc clang python3 git tar curl flex bison bc bzip2 lz4 cpio; do
             printf '  %-10s ' "$t"
-            if command -v "$t" >/dev/null 2>&1; then echo OK; else echo "缺失"; MISSING="$MISSING $t"; fi
+            if command -v "$t" >/dev/null 2>&1; then
+              echo OK
+            else
+              echo "缺失"
+              MISSING="$MISSING $t"
+            fi
           done
-          echo "缺失:$MISSING"
+          echo "缺失:[${MISSING}]"
+          # ★ 注意：不能写 for loop + `cmd && {...}`。
+          #   MISSING 为空时 grep 返回 1，&& 短路，for 循环最后一条命令的退出码就是 1，
+          #   set -e 会直接把整个 step 杀掉（上一轮就是这么失败的）。
+          #   用 if 包起来，if 不会触发 set -e。
           for hard in flex bison bc; do
-            echo "$MISSING" | grep -qw "$hard" && { echo "::error::缺少硬依赖 $hard"; exit 1; }
+            if echo "$MISSING" | grep -qw "$hard"; then
+              echo "::error::缺少硬依赖 $hard"
+              exit 1
+            fi
           done
+          echo "硬依赖齐全"
       - name: 下载 AOSP clang
         run: |
           set -e
