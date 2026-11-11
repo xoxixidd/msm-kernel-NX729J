@@ -246,21 +246,43 @@ jobs:
           grep -E '^CONFIG_(KSU|MODULES|KPROBES|MODVERSIONS|MODULE_SIG_FORCE|MODULE_FORCE_LOAD)=' out/.config || true
           grep -q '^CONFIG_KSU=m' out/.config || { echo "::error::CONFIG_KSU 没设成 m"; grep KSU out/.config | head; exit 1; }
 
-      - name: 准备 swap（FullLTO 链接内存峰值兜底）
+      - name: 准备 swap (FullLTO 链接内存峰值兜底)
         run: |
           set -e
-          # FullLTO 链接 vmlinux 时内存峰值很高，runner 的 7G 内存不够会 OOM 被杀
-          echo "=== 内存与磁盘 ==="
-          free -h || true
-          df -h / | tail -1 || true
-          if [ ! -f /swapfile ]; then
-            sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          echo "=== swap 前 ==="; free -m; df -h /
+          avail=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "根分区可用: ${avail}G"
+          # FullLTO + CFI + DWARF 的 vmlinux 链接是单进程内存大户；仅靠 16G 物理内存会
+          # 被外部 SIGTERM 掐掉（exit 143），所以补一块 swap 兜底。按剩余磁盘决定大小。
+          SIZE=""
+          if   [ "${avail:-0}" -ge 60 ]; then SIZE=24G
+          elif [ "${avail:-0}" -ge 36 ]; then SIZE=16G
+          elif [ "${avail:-0}" -ge 24 ]; then SIZE=8G
+          fi
+          if [ -z "$SIZE" ]; then
+            echo "!! 磁盘不足 24G，跳过 swap（内存峰值风险自负）"; free -m; exit 0
+          fi
+          echo "选定 swap 大小: $SIZE"
+          # 注意：runner 镜像自带的 swap 就在 /swapfile（只有 3G），与本步骤同路径。
+          # 上一版写成「已存在 /swapfile 就跳过」，结果 16G 从未真正建立（实测日志：
+          # 选定 16G -> 已存在 -> Swap 仍是 3071MB），等于没加。这里改为按大小比对，
+          # 不够就先 swapoff 再重建。
+          CUR=$(swapon --show=NAME,SIZE --noheadings 2>/dev/null | awk '$1=="/swapfile"{print $2; exit}')
+          if [ -n "$CUR" ] && [ "${CUR%G}" -ge "${SIZE%G}" ] 2>/dev/null; then
+            echo "现有 /swapfile 已是 $CUR >= $SIZE，无需重建"
+          else
+            echo "现有 /swapfile: ${CUR:-无} -> 重建为 $SIZE"
+            sudo swapoff /swapfile 2>/dev/null || true
+            sudo rm -f /swapfile
+            sudo fallocate -l "$SIZE" /swapfile || \
+              sudo dd if=/dev/zero of=/swapfile bs=1M count=$(( ${SIZE%G} * 1024 )) status=none
             sudo chmod 600 /swapfile
             sudo mkswap /swapfile
+            sudo swapon /swapfile
           fi
-          sudo swapon /swapfile || true
-          echo "=== swap 就绪 ==="
-          free -h || true
+          # 让内核更早把冷页换出去，给单进程大分配让路（一次性 runner，无副作用）
+          sudo sysctl -w vm.swappiness=100 || true
+          echo "=== swap 后 ==="; free -m; swapon --show
 
       - name: 编译 vmlinux（生成 Module.symvers）
         working-directory: kernel-tree
