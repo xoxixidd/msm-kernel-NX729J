@@ -418,6 +418,20 @@ jobs:
             || { echo "::error::补丁没打上（上游可能已修，或写法变了）"; grep -n 'latest_granting' "$F" | head; exit 1; }
           echo "补丁生效"
 
+      - name: 补齐 SUSFS 缺失符号（SukiSU 需要 avd_allowed / sus_type）
+        run: |
+          set -e
+          # 树里的 SUSFS 是 v2.3.0 适配版，缺 SukiSU builtin 引用的 4 个符号：
+          #   susfs_add_sus_avd_allowed_by_type  (sepolicy.c:334)
+          #   susfs_add_sus_type                 (sepolicy.c:761)
+          #   susfs_spoof_avd_allowed_rcu        (上游 services.c 用)
+          #   susfs_is_sus_type_rcu              (同上)
+          # 缺了会让 vmlinux 链接报 undefined symbol。
+          python3 .github/scripts/patch-susfs-avd.py
+          echo "=== 复核 ==="
+          grep -c 'susfs_add_sus_avd_allowed_by_type' fs/susfs.c
+          grep -c 'susfs_add_sus_avd_allowed_by_type' include/linux/susfs.h
+
       - name: 装编译依赖（绕过 apt，IP 直连 .deb）
         run: |
           set -e
